@@ -1,0 +1,17 @@
+{
+  "name": "telegram-stream-recorder",
+  "version": "2.0.0",
+  "description": "بوت تسجيل البث مع علامة مائية متحركة",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
