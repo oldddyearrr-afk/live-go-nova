@@ -202,10 +202,8 @@ function cleanup(...files) {
     });
 }
 
-// Recording loop with overlapping segments
+// Recording loop with instant sending
 async function recordingLoop() {
-    let nextRecordingPromise = null;
-    
     while (state.isRecording) {
         try {
             state.segmentCount++;
@@ -216,39 +214,24 @@ async function recordingLoop() {
             console.log(`⏺️ تسجيل #${state.segmentCount} [${startTime}ث → ${endTime}ث]`);
             console.log(`${'='.repeat(50)}\n`);
             
-            if (nextRecordingPromise) {
-                const videoFile = await nextRecordingPromise;
-                
-                if (state.isRecording) {
-                    nextRecordingPromise = recordSegment();
-                    
-                    if (state.users.size > 0) {
-                        await sendVideoToUsers(videoFile);
-                    } else {
-                        cleanup(videoFile);
-                    }
-                } else {
-                    cleanup(videoFile);
-                }
+            // تسجيل المقطع
+            const videoFile = await recordSegment();
+            
+            // إرسال فوري بمجرد انتهاء التسجيل
+            if (state.isRecording && state.users.size > 0) {
+                // إرسال بدون انتظار (fire and forget)
+                sendVideoToUsers(videoFile).catch(err => {
+                    console.error(`[ERROR] Send failed: ${err.message}`);
+                });
             } else {
-                nextRecordingPromise = recordSegment();
+                cleanup(videoFile);
             }
             
             if (global.gc) global.gc();
             
         } catch (error) {
             console.error(`[ERROR] Recording loop: ${error.message}`);
-            nextRecordingPromise = null;
             await new Promise(resolve => setTimeout(resolve, 3000));
-        }
-    }
-    
-    if (nextRecordingPromise) {
-        try {
-            const videoFile = await nextRecordingPromise;
-            cleanup(videoFile);
-        } catch (err) {
-            console.error(`[ERROR] Final cleanup: ${err.message}`);
         }
     }
     
