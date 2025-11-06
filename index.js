@@ -127,18 +127,39 @@ function recordSegment(startOffset = 0) {
 
 // Send video to users
 async function sendVideoToUsers(videoPath) {
+    console.log(`\n[SEND] === بدء عملية الإرسال ===`);
+    console.log(`[SEND] عدد المستخدمين: ${state.users.size}`);
+    console.log(`[SEND] المستخدمين: ${Array.from(state.users).join(', ')}`);
+    
+    if (state.users.size === 0) {
+        console.log('[WARN] ⚠️ لا يوجد مستخدمين! استخدم /start في البوت أولاً');
+        cleanup(videoPath);
+        return;
+    }
+    
+    if (!fs.existsSync(videoPath)) {
+        console.error('[ERROR] ❌ الملف غير موجود:', videoPath);
+        return;
+    }
+    
     const fileSize = fs.statSync(videoPath).size;
     const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
     
-    console.log(`[SEND] Sending video (${sizeMB}MB)...`);
+    console.log(`[SEND] 📁 الملف: ${path.basename(videoPath)}`);
+    console.log(`[SEND] 💾 الحجم: ${sizeMB}MB`);
     
     if (fileSize > 50 * 1024 * 1024) {
         console.log('[WARN] File >50MB, compressing...');
         videoPath = await compressVideo(videoPath);
     }
     
+    let successCount = 0;
+    let failCount = 0;
+    
     for (const userId of state.users) {
         try {
+            console.log(`[SEND] 📤 إرسال إلى ${userId}...`);
+            
             await bot.sendVideo(userId, videoPath, {
                 caption: 
                     `🎬 *مقطع من البث المباشر*\n\n` +
@@ -149,11 +170,18 @@ async function sendVideoToUsers(videoPath) {
                 parse_mode: 'Markdown',
                 supports_streaming: true
             });
-            console.log(`[SUCCESS] Sent to user: ${userId}`);
+            
+            successCount++;
+            console.log(`[SUCCESS] ✅ تم الإرسال إلى: ${userId}`);
         } catch (error) {
-            console.error(`[ERROR] Failed to send to ${userId}: ${error.message}`);
+            failCount++;
+            console.error(`[ERROR] ❌ فشل الإرسال إلى ${userId}: ${error.message}`);
         }
     }
+    
+    console.log(`[SEND] === نتيجة الإرسال ===`);
+    console.log(`[SEND] ✅ نجح: ${successCount} | ❌ فشل: ${failCount}`);
+    console.log(`[SEND] 🗑️ حذف الملف...\n`);
     
     cleanup(videoPath);
 }
@@ -218,12 +246,19 @@ async function recordingLoop() {
             const videoFile = await recordSegment();
             
             // إرسال فوري بمجرد انتهاء التسجيل
-            if (state.isRecording && state.users.size > 0) {
-                // إرسال بدون انتظار (fire and forget)
-                sendVideoToUsers(videoFile).catch(err => {
-                    console.error(`[ERROR] Send failed: ${err.message}`);
-                });
+            if (state.isRecording) {
+                if (state.users.size > 0) {
+                    // إرسال فوري مع معالجة الأخطاء
+                    sendVideoToUsers(videoFile).catch(err => {
+                        console.error(`[ERROR] ❌ فشل الإرسال: ${err.message}`);
+                        cleanup(videoFile);
+                    });
+                } else {
+                    console.log('[WARN] ⚠️ لا يوجد مستخدمين - تم حذف المقطع');
+                    cleanup(videoFile);
+                }
             } else {
+                console.log('[INFO] تم إيقاف التسجيل - حذف المقطع');
                 cleanup(videoFile);
             }
             
