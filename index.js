@@ -10,14 +10,14 @@ const CONFIG = {
     BOT_TOKEN: process.env.BOT_TOKEN,
     STREAM_URL: 'http://g.rosexz.xyz/at/sh/805768?token=SxAKVEBaQ14XUwYBBVYCD1VdBQRSB1cABAAEUVoFBw4JC1ADBQZUAVQTHBNGEEFcBQhpWAASCFcBAABTFUQTR0NXEGpaVkNeFwUHBgxVBAxGSRRFDV1XQA8ABlQKUFcFCAdXGRFCCAAXC15EWQgfGwEdQlQWXlMOalVUElAFAxQKXBdZXx5DC1tuVFRYBV1dRl8UAEYcEAtGQRNeVxMKWhwQAFxHQAAQUBMKX0AIXxVGBllECkRAGxcLEy1oREoUVUoWUF1BCAtbEwoTQRcRFUYMRW4WVUEWR1RQCVwURAwSAkAZEV8AHGpSX19bAVBNDQpYQkYKEFMXHRMJVggPQl9APUVaVkNeW0RcXUg',
     WATERMARK_TEXT: 't.me/xl9rr',
-    SEGMENT_DURATION: 17, // قللته من 17 لتقليل الحمل
+    SEGMENT_DURATION: 15, // قللته من 17 لتقليل الحمل
     MAX_DURATION: 30,     // قللته من 40
     TEMP_DIR: './temp',
     PORT: process.env.PORT || 3000,
     MAX_FILE_SIZE: 45 * 1024 * 1024, // 45MB حد أقصى
     // تحسينات الذاكرة
     MAX_CONCURRENT_PROCESSES: 1,
-    CLEANUP_INTERVAL: 30000, // تنظيف كل 30 ثانية
+    CLEANUP_INTERVAL: 20000, // تنظيف كل 30 ثانية
     MEMORY_LIMIT: 450 * 1024 * 1024 // 450MB حد أقصى
 };
 
@@ -187,11 +187,11 @@ function recordSegment() {
             .outputOptions([
                 '-c:v', 'libx264',
                 '-preset', 'fast',      // جودة أفضل مع سرعة معقولة
-                '-crf', '20',           // جودة عالية (23 أفضل من 28)
+                '-crf', '23',           // جودة عالية (23 أفضل من 28)
                 '-maxrate', '1.5M',     // زيادة قليلة في البيترات
                 '-bufsize', '3M',
                 '-c:a', 'aac',
-                '-b:a', '160k',         // جودة صوت أفضل
+                '-b:a', '128k',         // جودة صوت أفضل
                 '-ac', '2',
                 '-ar', '48000',         // تحسين جودة الصوت
                 '-movflags', '+faststart',
