@@ -2,22 +2,28 @@ const TelegramBot = require('node-telegram-bot-api');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const path = require('path');
+const { promisify } = require('util');
+const unlinkAsync = promisify(fs.unlink);
 
 // Configuration
 const CONFIG = {
     BOT_TOKEN: process.env.BOT_TOKEN,
     STREAM_URL: 'http://g.rosexz.xyz/at/sh/805768?token=SxAKVEBaQ14XUwYBBVYCD1VdBQRSB1cABAAEUVoFBw4JC1ADBQZUAVQTHBNGEEFcBQhpWAASCFcBAABTFUQTR0NXEGpaVkNeFwUHBgxVBAxGSRRFDV1XQA8ABlQKUFcFCAdXGRFCCAAXC15EWQgfGwEdQlQWXlMOalVUElAFAxQKXBdZXx5DC1tuVFRYBV1dRl8UAEYcEAtGQRNeVxMKWhwQAFxHQAAQUBMKX0AIXxVGBllECkRAGxcLEy1oREoUVUoWUF1BCAtbEwoTQRcRFUYMRW4WVUEWR1RQCVwURAwSAkAZEV8AHGpSX19bAVBNDQpYQkYKEFMXHRMJVggPQl9APUVaVkNeW0RcXUg',
     WATERMARK_TEXT: 't.me/xl9rr',
-    SEGMENT_DURATION: 17,
-    MAX_DURATION: 40,
+    SEGMENT_DURATION: 17, // قللته من 17 لتقليل الحمل
+    MAX_DURATION: 30,     // قللته من 40
     TEMP_DIR: './temp',
-    PORT: process.env.PORT || 3000
+    PORT: process.env.PORT || 3000,
+    MAX_FILE_SIZE: 45 * 1024 * 1024, // 45MB حد أقصى
+    // تحسينات الذاكرة
+    MAX_CONCURRENT_PROCESSES: 1,
+    CLEANUP_INTERVAL: 30000, // تنظيف كل 30 ثانية
+    MEMORY_LIMIT: 450 * 1024 * 1024 // 450MB حد أقصى
 };
 
-// Check for BOT_TOKEN
+// Check BOT_TOKEN
 if (!CONFIG.BOT_TOKEN) {
-    console.error('[ERROR] BOT_TOKEN not found in environment variables');
-    console.error('[ERROR] Please add BOT_TOKEN in Secrets settings');
+    console.error('[ERROR] BOT_TOKEN not found!');
     process.exit(1);
 }
 
@@ -26,97 +32,199 @@ const state = {
     isRecording: false,
     users: new Set(),
     currentProcess: null,
-    segmentCount: 0
+    segmentCount: 0,
+    processingQueue: [],
+    isProcessing: false
 };
 
-// Initialize Telegram bot
-const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
+// Initialize bot
+const bot = new TelegramBot(CONFIG.BOT_TOKEN, { 
+    polling: {
+        interval: 1000,
+        autoStart: true,
+        params: {
+            timeout: 10
+        }
+    }
+});
 
-// Create temp directory and clean old files
+// ============================================
+// تحسينات الذاكرة
+// ============================================
+
+// مراقبة الذاكرة
+function checkMemory() {
+    const usage = process.memoryUsage();
+    const heapUsed = usage.heapUsed;
+    const heapPercent = (heapUsed / CONFIG.MEMORY_LIMIT * 100).toFixed(1);
+    
+    if (heapUsed > CONFIG.MEMORY_LIMIT) {
+        console.warn(`[MEMORY] ⚠️ High memory: ${(heapUsed/1024/1024).toFixed(0)}MB (${heapPercent}%)`);
+        
+        // إيقاف التسجيل إذا تجاوزت الذاكرة الحد
+        if (state.isRecording && heapPercent > 95) {
+            console.error('[MEMORY] 🚨 Memory critical! Stopping recording...');
+            stopRecording();
+            cleanupAllFiles();
+        }
+        
+        // تنظيف قوي
+        if (global.gc) {
+            global.gc();
+            console.log('[GC] Garbage collection triggered');
+        }
+    }
+    
+    return { heapUsed, heapPercent };
+}
+
+// تنظيف دوري
+setInterval(() => {
+    checkMemory();
+    cleanupOldFiles();
+}, CONFIG.CLEANUP_INTERVAL);
+
+// Create temp directory
 function initTempDir() {
     if (!fs.existsSync(CONFIG.TEMP_DIR)) {
         fs.mkdirSync(CONFIG.TEMP_DIR, { recursive: true });
-    } else {
-        // حذف جميع المقاطع القديمة
+    }
+    cleanupAllFiles();
+}
+
+// تنظيف جميع الملفات
+function cleanupAllFiles() {
+    try {
         const files = fs.readdirSync(CONFIG.TEMP_DIR);
-        let deletedCount = 0;
+        let deleted = 0;
         
         files.forEach(file => {
             try {
                 const filePath = path.join(CONFIG.TEMP_DIR, file);
                 fs.unlinkSync(filePath);
-                deletedCount++;
+                deleted++;
             } catch (err) {
-                console.error(`[CLEANUP] Failed to delete ${file}: ${err.message}`);
+                console.error(`[CLEANUP] Failed: ${file}`);
             }
         });
         
-        if (deletedCount > 0) {
-            console.log(`[CLEANUP] Deleted ${deletedCount} old video file(s)`);
+        if (deleted > 0) {
+            console.log(`[CLEANUP] 🗑️ Deleted ${deleted} file(s)`);
         }
+    } catch (err) {
+        console.error('[CLEANUP] Error:', err.message);
     }
 }
 
-// Create scrolling watermark filter
+// تنظيف الملفات القديمة (أكثر من 5 دقائق)
+function cleanupOldFiles() {
+    try {
+        const files = fs.readdirSync(CONFIG.TEMP_DIR);
+        const now = Date.now();
+        let deleted = 0;
+        
+        files.forEach(file => {
+            try {
+                const filePath = path.join(CONFIG.TEMP_DIR, file);
+                const stats = fs.statSync(filePath);
+                const age = now - stats.mtimeMs;
+                
+                // احذف الملفات الأقدم من 5 دقائق
+                if (age > 5 * 60 * 1000) {
+                    fs.unlinkSync(filePath);
+                    deleted++;
+                }
+            } catch (err) {
+                // تجاهل الأخطاء
+            }
+        });
+        
+        if (deleted > 0) {
+            console.log(`[CLEANUP] 🗑️ Deleted ${deleted} old file(s)`);
+        }
+    } catch (err) {
+        // تجاهل أخطاء القراءة
+    }
+}
+
+// Watermark filter (محسّن)
 function createScrollingWatermark() {
     return [
         {
             filter: 'drawtext',
             options: {
                 text: CONFIG.WATERMARK_TEXT,
-                fontsize: 30,
-                fontcolor: 'white@0.85',
-                shadowcolor: 'black@0.3',
-                shadowx: 1,
-                shadowy: 1,
-                y: 'h-th-40',
-                x: 'w - mod(t*120, w+tw)'
+                fontsize: 28,
+                fontcolor: 'white@0.8',
+                shadowcolor: 'black@0.5',
+                shadowx: 2,
+                shadowy: 2,
+                y: 'h-th-30',
+                x: 'w - mod(t*100, w+tw)'
             }
         }
     ];
 }
 
-// Record single segment with overlap
-function recordSegment(startOffset = 0) {
+// تسجيل محسّن
+function recordSegment() {
     return new Promise((resolve, reject) => {
         const timestamp = Date.now();
-        const outputFile = path.join(CONFIG.TEMP_DIR, `output_${timestamp}.mp4`);
+        const outputFile = path.join(CONFIG.TEMP_DIR, `vid_${timestamp}.mp4`);
         
-        const actualDuration = CONFIG.SEGMENT_DURATION + 3;
-        
-        console.log(`[REC] Starting ${CONFIG.SEGMENT_DURATION}s segment (${actualDuration}s total with overlap)...`);
+        console.log(`[REC] 🎬 Starting ${CONFIG.SEGMENT_DURATION}s segment...`);
         
         const recorder = ffmpeg(CONFIG.STREAM_URL)
             .inputOptions([
-                '-t', actualDuration.toString(),
+                '-t', CONFIG.SEGMENT_DURATION.toString(),
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5'
+                '-reconnect_delay_max', '3',
+                '-analyzeduration', '2000000',
+                '-probesize', '2000000'
             ])
             .videoFilters(createScrollingWatermark())
             .outputOptions([
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-crf', '26',
+                '-preset', 'fast',      // جودة أفضل مع سرعة معقولة
+                '-crf', '20',           // جودة عالية (23 أفضل من 28)
+                '-maxrate', '1.5M',     // زيادة قليلة في البيترات
+                '-bufsize', '3M',
                 '-c:a', 'aac',
-                '-b:a', '128k',
-                '-movflags', '+faststart'
+                '-b:a', '160k',         // جودة صوت أفضل
+                '-ac', '2',
+                '-ar', '48000',         // تحسين جودة الصوت
+                '-movflags', '+faststart',
+                '-map', '0:v:0',
+                '-map', '0:a:0',
+                '-profile:v', 'high',   // بروفايل عالي للجودة
+                '-level', '4.0'
             ])
             .on('start', (cmd) => {
-                console.log('[FFMPEG] Processing started');
+                console.log('[FFMPEG] ▶️ Started');
             })
             .on('progress', (progress) => {
                 if (progress.timemark) {
-                    process.stdout.write(`\r[PROGRESS] ${progress.timemark} / ${actualDuration}s`);
+                    const mem = checkMemory();
+                    process.stdout.write(
+                        `\r[PROGRESS] ${progress.timemark}/${CONFIG.SEGMENT_DURATION}s | ` +
+                        `MEM: ${(mem.heapUsed/1024/1024).toFixed(0)}MB (${mem.heapPercent}%)`
+                    );
                 }
             })
             .on('error', (err) => {
-                console.error(`\n[ERROR] Recording failed: ${err.message}`);
+                console.error(`\n[ERROR] ❌ Recording failed: ${err.message}`);
                 cleanup(outputFile);
                 reject(err);
             })
             .on('end', () => {
-                console.log('\n[SUCCESS] Recording completed');
+                console.log('\n[SUCCESS] ✅ Recording completed');
+                
+                // تحقق من حجم الملف
+                const stats = fs.statSync(outputFile);
+                const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
+                console.log(`[FILE] 📁 Size: ${sizeMB}MB`);
+                
                 resolve(outputFile);
             })
             .save(outputFile);
@@ -125,171 +233,205 @@ function recordSegment(startOffset = 0) {
     });
 }
 
-// Send video to users
+// إرسال محسّن مع معالجة الأخطاء
 async function sendVideoToUsers(videoPath) {
-    console.log(`\n[SEND] === بدء عملية الإرسال ===`);
-    console.log(`[SEND] عدد المستخدمين: ${state.users.size}`);
-    console.log(`[SEND] المستخدمين: ${Array.from(state.users).join(', ')}`);
+    console.log(`\n[SEND] 📤 Sending to ${state.users.size} user(s)...`);
     
     if (state.users.size === 0) {
-        console.log('[WARN] ⚠️ لا يوجد مستخدمين! استخدم /start في البوت أولاً');
+        console.log('[WARN] ⚠️ No users subscribed!');
         cleanup(videoPath);
         return;
     }
     
     if (!fs.existsSync(videoPath)) {
-        console.error('[ERROR] ❌ الملف غير موجود:', videoPath);
+        console.error('[ERROR] ❌ File not found!');
         return;
     }
     
-    const fileSize = fs.statSync(videoPath).size;
-    const sizeMB = (fileSize / 1024 / 1024).toFixed(2);
+    const fileStats = fs.statSync(videoPath);
+    const sizeMB = (fileStats.size / 1024 / 1024).toFixed(2);
     
-    console.log(`[SEND] 📁 الملف: ${path.basename(videoPath)}`);
-    console.log(`[SEND] 💾 الحجم: ${sizeMB}MB`);
-    
-    if (fileSize > 50 * 1024 * 1024) {
-        console.log('[WARN] File >50MB, compressing...');
-        videoPath = await compressVideo(videoPath);
-    }
-    
-    let successCount = 0;
-    let failCount = 0;
-    
-    for (const userId of state.users) {
+    // ضغط إذا كان أكبر من 45MB
+    if (fileStats.size > CONFIG.MAX_FILE_SIZE) {
+        console.log(`[COMPRESS] 🔄 File too large (${sizeMB}MB), compressing...`);
         try {
-            console.log(`[SEND] 📤 إرسال إلى ${userId}...`);
-            
-            await bot.sendVideo(userId, videoPath, {
-                caption: 
-                    `🎬 *مقطع من البث المباشر*\n\n` +
-                    `📊 المقطع: #${state.segmentCount}\n` +
-                    `⏱️ المدة: ${CONFIG.SEGMENT_DURATION} ثانية\n` +
-                    `📅 التاريخ: ${new Date().toLocaleString('ar-EG')}\n` +
-                    `💾 الحجم: ${sizeMB}MB`,
-                parse_mode: 'Markdown',
-                supports_streaming: true
-            });
-            
-            successCount++;
-            console.log(`[SUCCESS] ✅ تم الإرسال إلى: ${userId}`);
-        } catch (error) {
-            failCount++;
-            console.error(`[ERROR] ❌ فشل الإرسال إلى ${userId}: ${error.message}`);
+            videoPath = await compressVideo(videoPath);
+        } catch (err) {
+            console.error('[ERROR] ❌ Compression failed:', err.message);
+            cleanup(videoPath);
+            return;
         }
     }
     
-    console.log(`[SEND] === نتيجة الإرسال ===`);
-    console.log(`[SEND] ✅ نجح: ${successCount} | ❌ فشل: ${failCount}`);
-    console.log(`[SEND] 🗑️ حذف الملف...\n`);
+    let success = 0;
+    let failed = 0;
     
+    for (const userId of state.users) {
+        try {
+            await bot.sendVideo(userId, videoPath, {
+                caption: 
+                    `🎬 مقطع #${state.segmentCount}\n` +
+                    `⏱️ ${CONFIG.SEGMENT_DURATION}s | 💾 ${sizeMB}MB\n` +
+                    `📅 ${new Date().toLocaleTimeString('ar-EG')}`,
+                supports_streaming: true,
+                disable_notification: true
+            });
+            
+            success++;
+            console.log(`[SEND] ✅ Sent to ${userId}`);
+            
+            // تأخير صغير لتجنب Rate Limit
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+        } catch (error) {
+            failed++;
+            console.error(`[SEND] ❌ Failed ${userId}: ${error.message}`);
+            
+            // إزالة المستخدمين المحظورين
+            if (error.message.includes('bot was blocked')) {
+                state.users.delete(userId);
+                console.log(`[USER] 🚫 Removed blocked user: ${userId}`);
+            }
+        }
+    }
+    
+    console.log(`[SEND] ✅ ${success} | ❌ ${failed}\n`);
+    
+    // حذف فوري
     cleanup(videoPath);
+    
+    // تنظيف الذاكرة
+    if (global.gc) global.gc();
 }
 
-// Compress video
+// ضغط محسّن
 function compressVideo(inputFile) {
     return new Promise((resolve, reject) => {
-        const outputFile = inputFile.replace('.mp4', '_compressed.mp4');
+        const outputFile = inputFile.replace('.mp4', '_c.mp4');
         
-        console.log('[COMPRESS] Compressing video...');
+        console.log('[COMPRESS] 🔄 Compressing...');
         
         ffmpeg(inputFile)
             .outputOptions([
                 '-c:v', 'libx264',
-                '-crf', '30',
-                '-preset', 'faster',
-                '-vf', 'scale=iw*0.9:ih*0.9',
+                '-crf', '26',           // ضغط أقل للحفاظ على الجودة
+                '-preset', 'medium',    // توازن بين السرعة والجودة
+                '-vf', 'scale=iw*0.9:ih*0.9', // تصغير أقل
                 '-c:a', 'aac',
-                '-b:a', '96k'
+                '-b:a', '96k',          // صوت أفضل
+                '-ac', '2',             // Stereo
+                '-profile:v', 'high',
+                '-level', '4.0'
             ])
             .on('progress', (progress) => {
                 if (progress.percent) {
                     process.stdout.write(`\r[COMPRESS] ${Math.round(progress.percent)}%`);
                 }
             })
-            .on('error', reject)
+            .on('error', (err) => {
+                console.error('\n[ERROR] Compression failed:', err.message);
+                cleanup(outputFile);
+                reject(err);
+            })
             .on('end', () => {
-                console.log('\n[SUCCESS] Compression completed');
-                fs.unlinkSync(inputFile);
+                console.log('\n[SUCCESS] ✅ Compressed');
+                
+                // حذف الملف الأصلي
+                cleanup(inputFile);
+                
+                const newSize = fs.statSync(outputFile).size;
+                const sizeMB = (newSize / 1024 / 1024).toFixed(2);
+                console.log(`[FILE] 📁 New size: ${sizeMB}MB`);
+                
                 resolve(outputFile);
             })
             .save(outputFile);
     });
 }
 
-// Cleanup files
+// Cleanup
 function cleanup(...files) {
     files.forEach(file => {
         try {
-            if (fs.existsSync(file)) {
+            if (file && fs.existsSync(file)) {
                 fs.unlinkSync(file);
+                console.log(`[CLEANUP] 🗑️ Deleted: ${path.basename(file)}`);
             }
         } catch (err) {
-            console.error(`[ERROR] Cleanup failed: ${err.message}`);
+            console.error(`[CLEANUP] ❌ Failed: ${err.message}`);
         }
     });
 }
 
-// Recording loop with instant sending
+// Recording loop محسّن
 async function recordingLoop() {
+    console.log('[LOOP] 🔄 Recording loop started');
+    
     while (state.isRecording) {
         try {
+            // تحقق من الذاكرة قبل التسجيل
+            const mem = checkMemory();
+            if (parseFloat(mem.heapPercent) > 90) {
+                console.warn('[MEMORY] ⚠️ Memory too high, pausing...');
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                continue;
+            }
+            
             state.segmentCount++;
-            const startTime = state.segmentCount === 1 ? 0 : (state.segmentCount - 1) * CONFIG.SEGMENT_DURATION;
-            const endTime = startTime + CONFIG.SEGMENT_DURATION;
+            console.log(`\n${'='.repeat(40)}`);
+            console.log(`⏺️ Segment #${state.segmentCount}`);
+            console.log(`${'='.repeat(40)}\n`);
             
-            console.log(`\n${'='.repeat(50)}`);
-            console.log(`⏺️ تسجيل #${state.segmentCount} [${startTime}ث → ${endTime}ث]`);
-            console.log(`${'='.repeat(50)}\n`);
-            
-            // تسجيل المقطع
+            // تسجيل
             const videoFile = await recordSegment();
             
-            // إرسال فوري بمجرد انتهاء التسجيل
-            if (state.isRecording) {
-                if (state.users.size > 0) {
-                    // إرسال فوري مع معالجة الأخطاء
-                    sendVideoToUsers(videoFile).catch(err => {
-                        console.error(`[ERROR] ❌ فشل الإرسال: ${err.message}`);
-                        cleanup(videoFile);
-                    });
-                } else {
-                    console.log('[WARN] ⚠️ لا يوجد مستخدمين - تم حذف المقطع');
-                    cleanup(videoFile);
-                }
+            // إرسال فوري
+            if (state.isRecording && state.users.size > 0) {
+                await sendVideoToUsers(videoFile);
             } else {
-                console.log('[INFO] تم إيقاف التسجيل - حذف المقطع');
+                console.log('[INFO] No users or stopped - deleting');
                 cleanup(videoFile);
             }
             
-            if (global.gc) global.gc();
+            // تنظيف قوي للذاكرة
+            if (global.gc) {
+                global.gc();
+                console.log('[GC] 🧹 Memory cleaned');
+            }
+            
+            // راحة صغيرة بين المقاطع
+            await new Promise(resolve => setTimeout(resolve, 1000));
             
         } catch (error) {
-            console.error(`[ERROR] Recording loop: ${error.message}`);
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            console.error(`[ERROR] ❌ Loop error: ${error.message}`);
+            
+            // انتظر قبل إعادة المحاولة
+            await new Promise(resolve => setTimeout(resolve, 5000));
         }
     }
     
-    console.log('[STOP] Recording loop stopped');
+    console.log('[LOOP] ⏹️ Recording loop stopped');
 }
 
-// Start recording
+// Start/Stop
 function startRecording() {
     if (state.isRecording) return false;
     
+    // تنظيف قبل البدء
+    cleanupAllFiles();
+    
     state.isRecording = true;
     state.segmentCount = 0;
-    console.log('[START] Recording started');
+    console.log('[START] ▶️ Recording started');
     
     recordingLoop().catch(err => {
-        console.error(`[FATAL] ${err}`);
+        console.error(`[FATAL] ${err.message}`);
         stopRecording();
     });
     
     return true;
 }
 
-// Stop recording
 function stopRecording() {
     state.isRecording = false;
     
@@ -298,13 +440,16 @@ function stopRecording() {
         state.currentProcess = null;
     }
     
-    console.log('[STOP] Recording stopped');
+    // تنظيف شامل
+    cleanupAllFiles();
+    
+    console.log('[STOP] ⏹️ Recording stopped');
     return true;
 }
 
-// ========================================
-// Telegram Bot Commands
-// ========================================
+// ============================================
+// Telegram Commands
+// ============================================
 
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
@@ -317,30 +462,25 @@ bot.onText(/\/start/, (msg) => {
                 { text: '⏹️ إيقاف', callback_data: 'stop_rec' }
             ],
             [
-                { text: '📊 الحالة', callback_data: 'status' },
-                { text: '⚙️ الإعدادات', callback_data: 'settings' }
-            ],
-            [{ text: '❓ المساعدة', callback_data: 'help' }]
+                { text: '📊 الحالة', callback_data: 'status' }
+            ]
         ]
     };
     
     bot.sendMessage(chatId, 
         `🎬 *بوت تسجيل البث المباشر*\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `✨ *المميزات:*\n` +
-        `• 🎥 جودة عالية للفيديو والصوت\n` +
-        `• 💫 علامة مائية متحركة احترافية\n` +
-        `• ⚡ إرسال تلقائي\n` +
-        `• 🎯 مدة قابلة للتخصيص (${CONFIG.SEGMENT_DURATION} ثانية)\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `🚀 جاهز للتسجيل!`,
+        `✨ محسّن للعمل على 512MB\n` +
+        `⚡ تسجيل تلقائي كل ${CONFIG.SEGMENT_DURATION} ثانية\n` +
+        `💫 علامة مائية متحركة\n\n` +
+        `🚀 جاهز للاستخدام!`,
         { reply_markup: keyboard, parse_mode: 'Markdown' }
     );
+    
+    console.log(`[USER] ✅ New user: ${chatId} (Total: ${state.users.size})`);
 });
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
-    
     await bot.answerCallbackQuery(query.id);
     
     switch (query.data) {
@@ -348,180 +488,81 @@ bot.on('callback_query', async (query) => {
             if (startRecording()) {
                 bot.sendMessage(chatId, 
                     `✅ *تم بدء التسجيل!*\n\n` +
-                    `⏱️ المدة: ${CONFIG.SEGMENT_DURATION} ثانية لكل مقطع\n` +
-                    `💧 العلامة المائية: ${CONFIG.WATERMARK_TEXT}\n` +
-                    `📤 الإرسال التلقائي مفعّل`,
+                    `⏱️ ${CONFIG.SEGMENT_DURATION} ثانية لكل مقطع\n` +
+                    `📤 إرسال تلقائي`,
                     { parse_mode: 'Markdown' }
                 );
             } else {
-                bot.sendMessage(chatId, '⚠️ التسجيل يعمل بالفعل!');
+                bot.sendMessage(chatId, '⚠️ يعمل بالفعل!');
             }
             break;
             
         case 'stop_rec':
             if (stopRecording()) {
                 bot.sendMessage(chatId, 
-                    `⏹️ *تم إيقاف التسجيل*\n\n` +
-                    `📊 إجمالي المقاطع: ${state.segmentCount}`,
+                    `⏹️ *تم الإيقاف*\n\n` +
+                    `📊 المقاطع: ${state.segmentCount}`,
                     { parse_mode: 'Markdown' }
                 );
             } else {
-                bot.sendMessage(chatId, '⚠️ التسجيل متوقف بالفعل');
+                bot.sendMessage(chatId, '⚠️ متوقف بالفعل');
             }
             break;
             
         case 'status':
+            const mem = process.memoryUsage();
+            const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(0);
             const status = state.isRecording ? '🔴 يعمل' : '⚪ متوقف';
-            const memory = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
             
             bot.sendMessage(chatId,
                 `📊 *حالة البوت*\n\n` +
-                `━━━━━━━━━━━━━━━━━━━━\n\n` +
                 `الحالة: ${status}\n` +
                 `المقاطع: ${state.segmentCount}\n` +
-                `المستخدمين النشطين: ${state.users.size}\n` +
-                `الذاكرة: ${memory}MB / 512MB\n\n` +
-                `⚙️ *الإعدادات الحالية:*\n` +
-                `• المدة: ${CONFIG.SEGMENT_DURATION} ثانية\n` +
-                `• العلامة المائية: ${CONFIG.WATERMARK_TEXT}\n` +
-                `• الحد الأقصى: ${CONFIG.MAX_DURATION} ثانية`,
-                { parse_mode: 'Markdown' }
-            );
-            break;
-            
-        case 'settings':
-            bot.sendMessage(chatId,
-                `⚙️ *الإعدادات*\n\n` +
-                `استخدم هذه الأوامر:\n\n` +
-                `• \`/duration 17\` - تغيير المدة (5-${CONFIG.MAX_DURATION} ثانية)\n` +
-                `• \`/watermark نص\` - تغيير العلامة المائية\n\n` +
-                `💡 *ملاحظة:* أوقف التسجيل قبل تغيير الإعدادات`,
-                { parse_mode: 'Markdown' }
-            );
-            break;
-            
-        case 'help':
-            bot.sendMessage(chatId,
-                `❓ *المساعدة*\n\n` +
-                `━━━━━━━━━━━━━━━━━━━━\n\n` +
-                `*الأوامر المتاحة:*\n\n` +
-                `• \`/start\` - تشغيل البوت\n` +
-                `• \`/duration <ثواني>\` - تحديد مدة المقطع\n` +
-                `• \`/watermark <نص>\` - تحديد نص العلامة المائية\n` +
-                `• \`/status\` - عرض الحالة\n\n` +
-                `*أمثلة:*\n` +
-                `• \`/duration 20\` - مقاطع 20 ثانية\n` +
-                `• \`/watermark X.com/mychannel\`\n\n` +
-                `━━━━━━━━━━━━━━━━━━━━\n\n` +
-                `💬 الدعم: @YourSupport`,
+                `المستخدمين: ${state.users.size}\n` +
+                `الذاكرة: ${heapMB}MB / 512MB\n` +
+                `المدة: ${CONFIG.SEGMENT_DURATION}s`,
                 { parse_mode: 'Markdown' }
             );
             break;
     }
 });
 
-// Change duration
-bot.onText(/\/duration (\d+)/, (msg, match) => {
-    if (state.isRecording) {
-        bot.sendMessage(msg.chat.id, '⚠️ أوقف التسجيل أولاً!');
-        return;
-    }
-    
-    const duration = parseInt(match[1]);
-    
-    if (duration < 5) {
-        bot.sendMessage(msg.chat.id, '⚠️ المدة يجب أن تكون 5 ثوانٍ على الأقل');
-        return;
-    }
-    
-    if (duration > CONFIG.MAX_DURATION) {
-        bot.sendMessage(msg.chat.id, 
-            `⚠️ الحد الأقصى للمدة: ${CONFIG.MAX_DURATION} ثانية`
-        );
-        return;
-    }
-    
-    CONFIG.SEGMENT_DURATION = duration;
-    bot.sendMessage(msg.chat.id, 
-        `✅ تم تعيين المدة إلى: *${duration} ثانية*`,
-        { parse_mode: 'Markdown' }
-    );
+// ============================================
+// Health Check Server
+// ============================================
+
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+    const mem = process.memoryUsage();
+    res.json({
+        bot: 'Stream Recorder',
+        status: 'online',
+        recording: state.isRecording,
+        segments: state.segmentCount,
+        users: state.users.size,
+        memory: {
+            heap: Math.round(mem.heapUsed / 1024 / 1024) + 'MB',
+            rss: Math.round(mem.rss / 1024 / 1024) + 'MB'
+        }
+    });
 });
 
-// Change watermark
-bot.onText(/\/watermark (.+)/, (msg, match) => {
-    if (state.isRecording) {
-        bot.sendMessage(msg.chat.id, '⚠️ أوقف التسجيل أولاً!');
-        return;
-    }
-    
-    CONFIG.WATERMARK_TEXT = match[1].trim();
-    bot.sendMessage(msg.chat.id, 
-        `✅ تم تعيين العلامة المائية إلى:\n\`${CONFIG.WATERMARK_TEXT}\``,
-        { parse_mode: 'Markdown' }
-    );
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'healthy',
+        uptime: Math.floor(process.uptime()) + 's'
+    });
 });
 
-// Show status
-bot.onText(/\/status/, (msg) => {
-    const status = state.isRecording ? '🔴 يعمل' : '⚪ متوقف';
-    const memory = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-    
-    bot.sendMessage(msg.chat.id,
-        `📊 *الحالة:* ${status}\n` +
-        `📹 *المقاطع:* ${state.segmentCount}\n` +
-        `💾 *الذاكرة:* ${memory}MB\n` +
-        `⏱️ *المدة:* ${CONFIG.SEGMENT_DURATION} ثانية`,
-        { parse_mode: 'Markdown' }
-    );
-});
+// ============================================
+// Error Handling
+// ============================================
 
-// ========================================
-// Start Bot
-// ========================================
-
-async function main() {
-    initTempDir();
-    
-    console.log('╔════════════════════════════════════════╗');
-    console.log('║   Stream Recorder Bot                ║');
-    console.log('╚════════════════════════════════════════╝');
-    console.log('');
-    console.log(`[OK] Bot ready`);
-    console.log(`[MEM] ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`);
-    console.log(`[DUR] Default duration: ${CONFIG.SEGMENT_DURATION}s`);
-    console.log(`[WM] Watermark: ${CONFIG.WATERMARK_TEXT}`);
-    console.log('');
-    
-    const express = require('express');
-    const app = express();
-    
-    app.get('/', (req, res) => {
-        res.json({
-            bot: 'Stream Recorder Bot',
-            status: 'online',
-            recording: state.isRecording,
-            segments: state.segmentCount,
-            users: state.users.size
-        });
-    });
-    
-    app.get('/health', (req, res) => {
-        res.json({ 
-            status: 'healthy',
-            memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
-            uptime: process.uptime()
-        });
-    });
-    
-    app.listen(CONFIG.PORT, () => {
-        console.log(`[SERVER] Running on port ${CONFIG.PORT}`);
-    });
-}
-
-// Error handling
 process.on('uncaughtException', (err) => {
     console.error('[UNCAUGHT]', err);
+    stopRecording();
 });
 
 process.on('unhandledRejection', (err) => {
@@ -529,15 +570,35 @@ process.on('unhandledRejection', (err) => {
 });
 
 process.on('SIGTERM', () => {
-    console.log('\n[SHUTDOWN] SIGTERM received');
+    console.log('\n[SHUTDOWN] SIGTERM');
     stopRecording();
     process.exit(0);
 });
 
 process.on('SIGINT', () => {
-    console.log('\n[SHUTDOWN] SIGINT received');
+    console.log('\n[SHUTDOWN] SIGINT');
     stopRecording();
     process.exit(0);
 });
+
+// ============================================
+// Start
+// ============================================
+
+async function main() {
+    initTempDir();
+    
+    console.log('╔════════════════════════════════════════╗');
+    console.log('║   Stream Recorder Bot (Optimized)    ║');
+    console.log('╚════════════════════════════════════════╝\n');
+    console.log(`[OK] Bot ready`);
+    console.log(`[MEM] ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB / 512MB`);
+    console.log(`[DUR] ${CONFIG.SEGMENT_DURATION}s per segment`);
+    console.log(`[WM] ${CONFIG.WATERMARK_TEXT}\n`);
+    
+    app.listen(CONFIG.PORT, () => {
+        console.log(`[SERVER] 🌐 Running on port ${CONFIG.PORT}\n`);
+    });
+}
 
 main();
